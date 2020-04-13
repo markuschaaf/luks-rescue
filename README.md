@@ -12,3 +12,16 @@ which you may extract with:
 <pre>
 cryptsetup luksDump --dump-master-key --master-key-file <i>keyfile</i> <i>image</i>
 </pre>
+
+## Usage
+<pre>
+luks-rescue image_file=... master_key_file=... sector_count=...
+</pre>
+optional parameters (with defaults):
+`sector_size=512`, `alignment=32K`, `certainty=25%`
+
+output parameters:
+`data_file=...`, `tag_file=...`
+
+If you don't know sector size or sector count, `cryptsetup open` the
+device and use `fdisk -l`.

@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <nettle/gcm.h>
 #include <string.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 
 using namespace std;
 
@@ -28,17 +30,25 @@ struct File {
     ~File() { if( close( fd )) fatal(); }
     File( Sz name, int flags );
     void stat( struct stat &st ) const { if( fstat( fd, &st )) fatal(); }
+    uint64_t blkGetSize() const { uint64_t sz; if( ioctl( fd, BLKGETSIZE64, &sz )) fatal(); return sz; }
     struct Stat : stat {
         Stat( File const& file ) { file.stat( *this ); }
         Size size() const { return st_size; }
     };
+    Size size() const;
 };
+
+File::Size File::size() const
+{
+    Stat st( *this );
+    return S_ISBLK( st.st_mode ) ? blkGetSize() : st.st_size;
+}
 
 File::File( Sz name, int flags )
 :   name( name ),
     fd( open( name, flags | O_CLOEXEC | O_NOCTTY, 0666 ))
 {
-    if( fd < 0 ) fatal();
+    if( fd < 0 ) die( "%s: open: %m", name );
 }
 
 struct InFile : File {
@@ -72,11 +82,11 @@ struct RoMapping {
 
 RoMapping::RoMapping( InFile const& file )
 {
-    File::Size fsz = File::Stat( file ).size();
+    File::Size fsz = file.size();
     if( fsz > SIZE_MAX ) die( "%s: too big to mmap", file.name );
     size = fsz;
     void *pa = mmap( nullptr, size, PROT_READ, MAP_SHARED, file.fd, 0 );
-    if( pa == MAP_FAILED ) file.fatal();
+    if( pa == MAP_FAILED ) die( "%s: mmap( 0, %zx, PROT_READ, MAP_SHARED, %d, 0 ): %m", file.name, size, file.fd );
     data = (Byte const *) pa;
 }
 

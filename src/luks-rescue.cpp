@@ -1,4 +1,5 @@
 #include "die.hpp"
+#include "cli.hpp"
 #include <stdint.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -79,42 +80,6 @@ RoMapping::RoMapping( InFile const& file )
     data = (Byte const *) pa;
 }
 
-struct Argv {
-    struct Lazy {
-        Sz arg, title;
-        uintmax_t getUint( uintmax_t max ) const;
-        template< class U > operator U() const {
-            static_assert( is_integral_v< U > && is_unsigned_v< U > );
-            if constexpr( is_integral_v< U > && is_unsigned_v< U > ) return getUint( numeric_limits< U >::max() );
-        }
-        operator Sz() const { return arg; }
-        Lazy( Sz arg, Sz title ) : arg( arg ), title( title ) {}
-    };
-    template< class T >
-    struct LazyDef {
-        Lazy lazy;
-        T def;
-        template< class U > operator U() const { return lazy.arg ? lazy : def; }
-        LazyDef( Sz arg, Sz title, T def ) : lazy( arg, title ), def( def ) {}
-    };
-    char** argv_;
-    Argv( char** argv ) : argv_( argv ) { if( !*argv_ ) die( "missing argv[0]" ); ++argv_; }
-    ~Argv() { while( *argv_ ) fprintf( stderr, "extra argument ignored: %s\n", *argv_++ ); }
-    Lazy operator()( Sz title ) { if( !*argv_ ) die( "%s missing", title ); return { *argv_++, title }; }
-    LazyDef< uintmax_t > operator()( Sz title, uintmax_t def ) { return { *argv_ ? *argv_++ : nullptr, title, def }; }
-};
-
-uintmax_t Argv::Lazy::getUint( uintmax_t max ) const
-{
-    char* end;
-    errno = 0;
-    uintmax_t val = strtoull( arg, &end, 0 );
-    if( !errno && *end != '\0' ) errno = EINVAL;
-    if( !errno && val > max ) errno = ERANGE;
-    if( errno ) die( "%s: %m", title );
-    return val;
-}
-
 struct AesGcm {
     static constexpr size_t digestSz = GCM_DIGEST_SIZE;
     static constexpr size_t ivSz = GCM_IV_SIZE;
@@ -132,7 +97,7 @@ struct LuksAesGcmPlain : AesGcm {
     size_t secCnt, secSz, offset, secPerArea, metaSz, areaSz;
     LuksAesGcmPlain( Byte const* img, size_t imgSz, Byte const* key, size_t keySz, size_t secCnt, size_t secSz );
     unsigned findOffset( size_t alignSz, unsigned minCert );
-    void rescue( OutFile const& of );
+    void rescue( OutFile const& df, OutFile const& tf );
     unsigned canDecrypt();
     unsigned canDecryptArea( size_t area );
     void initCrypt( size_t secIdx );
@@ -201,7 +166,7 @@ void LuksAesGcmPlain::initCrypt( size_t secIdx )
     addAAD( aad, sizeof aad );
 }
 
-void LuksAesGcmPlain::rescue( OutFile const& of )
+void LuksAesGcmPlain::rescue( OutFile const& df, OutFile const& tf )
 {
     Byte tgt[ secSz ], digest[ digestSz ];
     size_t areaCnt = ( secCnt + ( secPerArea - 1 )) / secPerArea;
@@ -220,26 +185,121 @@ void LuksAesGcmPlain::rescue( OutFile const& of )
             decrypt( data + sec * secSz, secSz, tgt );
             getDigest( digest );
             if( 0 == memcmp( digest, meta + sec * digestSz, digestSz )) ++ok;
-            of.write( tgt, secSz );
+            df.write( tgt, secSz );
+            tf.write( digest, digestSz );
         }
         fputc(( ok ? ok == sec ? '.' : 'o' : 'O' ), stderr );
     }
     fputc( '\n', stderr );
 }
 
+enum Percent : unsigned;
+
+void cli_read( Sz arg, Sz &var )
+{
+    var = arg;
+}
+
+void cli_read( Sz arg, size_t &var )
+{
+    size_t val = 0;
+    unsigned base = 10;
+    if( *arg == '0' ) {
+        ++arg;
+        if( *arg == 'x' ) { ++arg; base = 16; }
+        else base = 8;
+    }
+    for(;;) {
+        unsigned d;
+        if( *arg >= '0' && *arg <= '9' ) d = *arg - '0'; else
+        if( *arg >= 'a' && *arg <= 'f' ) d = *arg - 'a'; else
+        if( *arg >= 'A' && *arg <= 'F' ) d = *arg - 'A';
+        else break;
+        if( d >= base ) die( "bad digit '%c' (base = %u)", d, base );
+        val *= base;
+        val += d;
+        ++arg;
+    }
+    if( *arg == 'K' ) { val *= size_t(1) << 10; ++arg; }
+    if( *arg == 'M' ) { val *= size_t(1) << 20; ++arg; }
+    if( *arg == 'G' ) { val *= size_t(1) << 30; ++arg; }
+    if( *arg == 'T' ) { val *= size_t(1) << 40; ++arg; }
+    if( *arg != 0 ) die( "bad format" );
+    var = val;
+}
+
+void cli_read( Sz arg, Percent &var )
+{
+    unsigned val = 0;
+    for(;;) {
+        unsigned d;
+        if( *arg >= '0' && *arg <= '9' ) d = *arg - '0';
+        else break;
+        val *= 10;
+        val += d;
+        ++arg;
+    }
+    if( arg[0] != '%' || arg[1] != 0 ) die( "bad format" );
+    var = (Percent) val;
+}
+
+CLI_PARAMS(
+    (( image_file       , Sz        ))
+    (( master_key_file  , Sz        ))
+    (( sector_count     , size_t    ))
+    (( data_file        , Sz        ))
+    (( tag_file         , Sz        ))
+    (( sector_size      , size_t    , 0x200         ))
+    (( alignment        , size_t    , 0x8000        ))
+    (( certainty        , Percent   , (Percent) 25  ))
+)
+
+void cli_parse_argv( char **argv )
+{
+    if( !*argv ) die( "missing argv[0]" );
+    while( *++argv ) {
+        char *p = strchr( *argv, '=' );
+        if( !p || !p[1] ) die( "%s: missing argument", *argv );
+        *p++ = 0;
+        params.read( *argv, p );
+    }
+}
+
+void Params::check()
+{
+    #define need( p ) if( !p ) die( "missing %s", #p );
+    need( image_file );
+    need( master_key_file );
+    need( sector_count );
+    #undef need
+    switch( sector_size ) {
+        default:
+            die( "bad sector_size" );
+        case 0x200:
+        case 0x400:
+        case 0x800:
+        case 0x1000:
+            ;
+    }
+}
+
 int main( int , char** argv )
 {
     try {
-        Argv arg( argv );
-        Sz imgFn = arg( "image file" ), keyFn = arg( "master key file" ), outFn( arg( "output file" ));
-        size_t secCnt = arg( "sector count" ), secSz = arg( "sector size", 0x200 ), alignSz = arg( "alignment size", 0x8000 );
-        unsigned minCert = arg( "minimum certainty", 25 );
-        RoMapping img{ InFile{ imgFn }}, key{ InFile{ keyFn }};
-        LuksAesGcmPlain luks( img.data, img.size, key.data, key.size, secCnt, secSz );
+        cli_parse_argv( argv );
+        params.check();
+        RoMapping img{ InFile{ params.image_file }}, key{ InFile{ params.master_key_file }};
+        LuksAesGcmPlain luks( img.data, img.size, key.data, key.size, params.sector_count, params.sector_size );
         fprintf( stderr, "searching data offset ...\n" );
-        if( unsigned r = luks.findOffset( alignSz, minCert ); r ) {
+        if( unsigned r = luks.findOffset( params.alignment, params.certainty ); r ) {
             fprintf( stderr, "found offset %#zx with %u%% certainty\n", luks.offset, r );
-            luks.rescue( OutFile( outFn ));
+            if( params.data_file || params.tag_file ) {
+                #define def( p ) if( !p ) p = "/dev/null";
+                def( params.data_file );
+                def( params.tag_file );
+                #undef def
+                luks.rescue( OutFile( params.data_file ), OutFile( params.tag_file ));
+            }
         } else
             die( "Cannot find offset." );
     }
